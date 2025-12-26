@@ -3,14 +3,16 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>语音笔记 (在线版)</title>
+    <title>语音笔记 (跨设备同步版)</title>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+    <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
     <style>
         :root {
             --bg-color: #030610;
             --accent-color: #00ffc8;
             --text-color: #ffffff;
             --panel-bg: rgba(13, 22, 40, 0.8);
+            --secondary-color: #4a5568;
         }
 
         * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
@@ -42,6 +44,17 @@
         
         .icon-btn {
             background: none; border: none; font-size: 20px; cursor: pointer; color: var(--accent-color);
+            padding: 5px;
+        }
+        
+        .connection-status {
+            font-size: 12px;
+            color: #666;
+            margin-left: 8px;
+        }
+        
+        .connection-status.connected {
+            color: var(--accent-color);
         }
 
         /* Transcript Area */
@@ -78,6 +91,11 @@
             word-break: break-all;
         }
 
+        .msg.local {
+            border-left-color: #bd93f9;
+            background: rgba(189, 147, 249, 0.05);
+        }
+
         .msg.interim {
             opacity: 0.6;
             border-left-color: #666;
@@ -103,7 +121,7 @@
 
         /* Controls */
         #controls {
-            height: 160px;
+            height: 180px;
             display: flex;
             flex-direction: column;
             align-items: center;
@@ -128,6 +146,7 @@
             align-items: center;
             transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
             box-shadow: 0 0 15px rgba(0, 255, 200, 0.2);
+            margin-bottom: 10px;
         }
 
         #mic-btn.recording {
@@ -137,6 +156,14 @@
             box-shadow: 0 0 30px rgba(0, 255, 200, 0.6);
             animation: pulse 1.5s infinite;
         }
+        
+        #mic-btn.disabled {
+            border-color: #666;
+            color: #666;
+            background: rgba(255, 255, 255, 0.05);
+            box-shadow: none;
+            cursor: not-allowed;
+        }
 
         @keyframes pulse {
             0% { box-shadow: 0 0 0 0 rgba(0, 255, 200, 0.7); }
@@ -145,11 +172,22 @@
         }
 
         #status {
-            margin-bottom: 15px;
+            margin-bottom: 8px;
             font-size: 14px;
             color: var(--accent-color);
             opacity: 0.8;
             letter-spacing: 1px;
+            text-align: center;
+            height: 20px;
+        }
+
+        #device-role {
+            font-size: 12px;
+            color: #888;
+            margin-bottom: 15px;
+            background: rgba(255,255,255,0.1);
+            padding: 4px 12px;
+            border-radius: 12px;
         }
 
         #tips {
@@ -193,46 +231,156 @@
 <body>
 
 <header>
-    <button class="icon-btn" id="qr-btn">📱</button>
+    <div style="display:flex; align-items:center;">
+        <button class="icon-btn" id="qr-btn" title="显示二维码">📱</button>
+        <span id="conn-status" class="connection-status">等待连接...</span>
+    </div>
     <h2>VOICE NOTE</h2>
-    <div style="width: 24px;"></div> <!-- Spacer -->
+    <button class="icon-btn" id="clear-btn" title="清空记录">🗑️</button>
 </header>
 
 <div id="transcript">
     <!-- Messages will appear here -->
+    <div style="text-align:center; color:#666; padding-top:50px; font-size:14px;" id="welcome-msg">
+        电脑端：点击左上角手机图标获取二维码<br>
+        手机端：扫码连接后开始说话
+    </div>
 </div>
 
 <div id="controls">
-    <div id="status">点击麦克风开始</div>
+    <div id="device-role">正在初始化...</div>
+    <div id="status">准备就绪</div>
     <button id="mic-btn">🎤</button>
-    <div id="tips">推荐使用 Safari (iOS) 或 Chrome (PC/Android)</div>
+    <div id="tips">推荐使用 Chrome / Safari / Edge</div>
 </div>
 
 <div id="qr-modal">
     <div id="qrcode"></div>
-    <div style="color: white; margin: 10px 0 20px; font-size: 14px;">手机扫码访问</div>
+    <div style="color: white; margin: 10px 0 20px; font-size: 14px; text-align: center;">
+        手机扫码连接此电脑<br>
+        <span style="font-size:12px; opacity:0.7;">(请确保网络通畅)</span>
+    </div>
     <button class="close-btn" onclick="document.getElementById('qr-modal').style.display='none'">关闭</button>
 </div>
 
 <script>
-    // Elements
+    // --- UI Elements ---
     const micBtn = document.getElementById('mic-btn');
     const statusText = document.getElementById('status');
     const transcriptDiv = document.getElementById('transcript');
     const tipsText = document.getElementById('tips');
+    const qrBtn = document.getElementById('qr-btn');
+    const connStatus = document.getElementById('conn-status');
+    const roleLabel = document.getElementById('device-role');
+    const clearBtn = document.getElementById('clear-btn');
+    const welcomeMsg = document.getElementById('welcome-msg');
 
-    // Speech Recognition
-    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-    let recognition;
+    // --- State ---
     let isRecording = false;
-    let finalTranscript = '';
+    let recognition;
+    let peer;
+    let conn;
+    let myPeerId;
+    let targetPeerId;
     
-    // Check support
+    // Parse URL params
+    const urlParams = new URLSearchParams(window.location.search);
+    targetPeerId = urlParams.get('host');
+
+    // --- Role Setup ---
+    if (targetPeerId) {
+        // Client Mode (Mobile)
+        roleLabel.textContent = "当前设备: 语音输入端 (手机)";
+        micBtn.style.display = 'flex';
+        qrBtn.style.display = 'none'; // Clients don't need to show QR
+        welcomeMsg.style.display = 'none';
+    } else {
+        // Host Mode (PC)
+        roleLabel.textContent = "当前设备: 接收显示端 (电脑)";
+        micBtn.style.opacity = '0.5'; // Optional for PC
+        welcomeMsg.style.display = 'block';
+    }
+
+    // --- PeerJS / WebRTC Sync ---
+    function initPeer() {
+        peer = new Peer(null, {
+            debug: 2
+        });
+
+        peer.on('open', (id) => {
+            myPeerId = id;
+            console.log('My Peer ID:', id);
+            
+            if (targetPeerId) {
+                connectToHost(targetPeerId);
+            } else {
+                connStatus.textContent = "等待手机连接...";
+            }
+        });
+
+        // Handle incoming connections (Host logic)
+        peer.on('connection', (c) => {
+            conn = c;
+            setupConnection();
+            connStatus.textContent = "已连接手机";
+            connStatus.classList.add('connected');
+            welcomeMsg.style.display = 'none';
+            statusText.textContent = "手机端已连接，请说话";
+        });
+        
+        peer.on('error', (err) => {
+            console.error(err);
+            connStatus.textContent = "连接服务错误";
+            tipsText.textContent = "无法连接到同步服务，请刷新重试";
+        });
+    }
+
+    function connectToHost(id) {
+        connStatus.textContent = "正在连接电脑...";
+        conn = peer.connect(id);
+        setupConnection();
+    }
+
+    function setupConnection() {
+        if (!conn) return;
+
+        conn.on('open', () => {
+            console.log("Connected to peer");
+            connStatus.textContent = "已连接同步";
+            connStatus.classList.add('connected');
+            if (targetPeerId) {
+                // We are client
+                statusText.textContent = "已连接，点击麦克风开始";
+            }
+        });
+
+        conn.on('data', (data) => {
+            // Receive data
+            if (data.type === 'text') {
+                addMessage(data.content, false);
+            }
+        });
+        
+        conn.on('close', () => {
+            connStatus.textContent = "连接断开";
+            connStatus.classList.remove('connected');
+        });
+    }
+
+    // Send data helper
+    function sendTextToPeer(text) {
+        if (conn && conn.open) {
+            conn.send({ type: 'text', content: text });
+        }
+    }
+
+    // --- Speech Recognition ---
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    
     if (!SpeechRecognition) {
-        statusText.textContent = "当前浏览器不支持语音识别";
-        tipsText.textContent = "请尝试使用 Chrome, Edge 或 Safari";
-        micBtn.style.opacity = "0.5";
-        micBtn.disabled = true;
+        statusText.textContent = "浏览器不支持语音识别";
+        tipsText.textContent = "请使用 Chrome, Safari (iOS 14.5+), 或 Edge";
+        micBtn.classList.add('disabled');
     } else {
         recognition = new SpeechRecognition();
         recognition.lang = 'zh-CN';
@@ -243,11 +391,16 @@
             isRecording = true;
             micBtn.classList.add('recording');
             statusText.textContent = "正在聆听...";
+            // Prevent sleep if possible
+            if (navigator.wakeLock) {
+                navigator.wakeLock.request('screen').catch(console.error);
+            }
         };
 
         recognition.onend = () => {
             if (isRecording) {
-                // Auto-restart for continuous listening
+                // Auto restart
+                console.log("Recognition ended, restarting...");
                 try { recognition.start(); } catch(e) {}
             } else {
                 micBtn.classList.remove('recording');
@@ -257,40 +410,50 @@
 
         recognition.onresult = (event) => {
             let interimTranscript = '';
+            let finalSegment = '';
 
             for (let i = event.resultIndex; i < event.results.length; ++i) {
                 if (event.results[i].isFinal) {
-                    const text = event.results[i][0].transcript;
-                    addMessage(text);
+                    finalSegment += event.results[i][0].transcript;
                 } else {
                     interimTranscript += event.results[i][0].transcript;
                 }
             }
-            
-            // Show interim (optional, can be implemented if needed)
-            // For now we just focus on final results to keep UI clean
+
+            if (finalSegment) {
+                // Add to local UI
+                addMessage(finalSegment, true);
+                // Send to peer
+                sendTextToPeer(finalSegment);
+            }
+
             if (interimTranscript) {
-                statusText.textContent = "正在输入: " + interimTranscript;
+                statusText.textContent = "Listening: " + interimTranscript;
             } else {
                 statusText.textContent = "正在聆听...";
             }
         };
-
+        
         recognition.onerror = (event) => {
-            console.error(event.error);
+            console.error("Speech Error:", event.error);
             if (event.error === 'not-allowed') {
                 statusText.textContent = "请允许麦克风权限";
                 isRecording = false;
                 micBtn.classList.remove('recording');
-            } else if (event.error === 'network') {
-                statusText.textContent = "网络错误 (需连接互联网)";
+            } else if (event.error === 'no-speech') {
+                // Ignore, will restart or continue
+            } else {
+                statusText.textContent = "识别错误: " + event.error;
             }
         };
     }
 
-    // Toggle Recording
+    // --- Event Listeners ---
     micBtn.addEventListener('click', () => {
         if (!recognition) return;
+        
+        // Haptic feedback
+        if (navigator.vibrate) navigator.vibrate(50);
 
         if (isRecording) {
             isRecording = false;
@@ -298,26 +461,36 @@
             micBtn.classList.remove('recording');
             statusText.textContent = "已停止";
         } else {
-            // Need to clear stack or just start
+            // Check context state if audioContext exists (not used here but good practice)
             try {
                 recognition.start();
             } catch(e) {
-                console.log("Restarting...");
-                recognition.stop();
-                setTimeout(() => recognition.start(), 100);
+                recognition.stop(); // Reset
+                setTimeout(() => recognition.start(), 200);
             }
         }
     });
 
+    clearBtn.addEventListener('click', () => {
+        if(confirm('确定清空所有记录吗？')) {
+            transcriptDiv.innerHTML = '';
+            transcriptDiv.appendChild(welcomeMsg);
+            // Don't necessarily sync clear, but we could
+        }
+    });
+
     // Add Message to UI
-    function addMessage(text) {
+    function addMessage(text, isLocal) {
         if (!text.trim()) return;
+        
+        // Hide welcome message
+        welcomeMsg.style.display = 'none';
 
         const row = document.createElement('div');
         row.className = 'msg-row';
 
         const msg = document.createElement('div');
-        msg.className = 'msg';
+        msg.className = 'msg' + (isLocal ? ' local' : '');
         msg.textContent = text;
 
         const btn = document.createElement('button');
@@ -334,22 +507,37 @@
         row.appendChild(btn);
         transcriptDiv.appendChild(row);
         
-        // Scroll to bottom
+        // Auto scroll
         transcriptDiv.scrollTop = transcriptDiv.scrollHeight;
     }
 
-    // QR Code
-    document.getElementById('qr-btn').onclick = () => {
+    // QR Code Generation
+    qrBtn.onclick = () => {
         const modal = document.getElementById('qr-modal');
         const container = document.getElementById('qrcode');
+        
+        if (!myPeerId) {
+            alert("正在连接同步服务，请稍候...");
+            return;
+        }
+
         modal.style.display = 'flex';
         container.innerHTML = '';
+        
+        // Generate URL with host param
+        const baseUrl = window.location.href.split('?')[0];
+        const connectionUrl = `${baseUrl}?host=${myPeerId}`;
+        
         new QRCode(container, {
-            text: window.location.href,
+            text: connectionUrl,
             width: 200,
             height: 200
         });
     };
+
+    // Initialize
+    initPeer();
+
 </script>
 
 </body>
